@@ -94,6 +94,8 @@
       <DesignTimeSharedInput>True</DesignTimeSharedInput>
       <DependentUpon>Settings.settings</DependentUpon>
     </Compile>
+    <Compile Include="RespawnTimeReader.cs" />
+    <Compile Include="RuelBridge.cs" />
     <Compile Include="Settings.cs" />
   </ItemGroup>
   <ItemGroup>
