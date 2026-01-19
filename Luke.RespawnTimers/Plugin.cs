@@ -1,114 +1,160 @@
-﻿using LabApi.Events.Handlers;
+﻿using System;
+using System.Linq;
+using System.Reflection;
+using System.Threading;
+
 using LabApi.Features;
 using LabApi.Features.Wrappers;
-using Respawning;
-using RueI;
-using RueI.API;
-using RueI.API.Elements;
-using System;
-using System.Collections.Generic;
-using System.Threading;
-using System.Threading.Tasks;
+using LabApi.Loader.Features.Plugins;
+
+using PlayerRoles;
 
 namespace Luke.RespawnTimers
 {
-    public class Plugin : LabApi.Features.Plugin
+    public sealed class RespawnTimersPlugin : Plugin
     {
-        public override string Name => "Luke.RespawnTimers";
-        public override string Description => "Shows spectators a mm:ss timer until the next respawn wave.";
-        public override string Author => "OceLuke";
-        public override Version Version => new Version(1, 0, 0);
-        public override Version RequiredApiVersion => new Version(14, 2, 5);
+        public override string Name { get; } = "Luke.RespawnTimers";
+        public override string Description { get; } = "Shows spectators a MM:SS timer until the next respawn wave.";
+        public override string Author { get; } = "OceLuke";
+        public override Version Version { get; } = new Version(1, 0, 0, 0);
+        public override Version RequiredApiVersion { get; } = new Version(LabApiProperties.CompiledVersion);
 
-        // One tag per player so we can update the same line cleanly
-        private readonly Dictionary<int, Tag> _tagsByPlayerId = new Dictionary<int, Tag>();
-
-        private CancellationTokenSource _cts;
-        private Task _loopTask;
+        private Timer _timer;
 
         public override void Enable()
         {
-            // Hook events
-            PlayerEvents.Left += OnPlayerLeft;
-
-            // Start update loop
-            _cts = new CancellationTokenSource();
-            _loopTask = Task.Run(() => Loop(_cts.Token));
-
-            base.Enable();
+            // Update once per second (exact mm:ss)
+            _timer = new Timer(Tick, null, 0, 1000);
         }
 
         public override void Disable()
         {
-            PlayerEvents.Left -= OnPlayerLeft;
+            if (_timer != null)
+            {
+                _timer.Dispose();
+                _timer = null;
+            }
+        }
 
+        private void Tick(object state)
+        {
             try
             {
-                _cts?.Cancel();
+                int seconds = GetSecondsToNextRespawn();
+                if (seconds < 0) seconds = 0;
+
+                string mmss = FormatMmSs(seconds);
+                string text = "<align=\"center\"><size=24><b>Respawning in " + mmss + "</b></size></align>";
+
+                foreach (Player p in Player.List)
+                {
+                    if (p == null || p.ReferenceHub == null)
+                        continue;
+
+                    // Spectators only
+                    RoleTypeId role = p.ReferenceHub.roleManager.CurrentRole.RoleTypeId;
+                    if (role != RoleTypeId.Spectator)
+                        continue;
+
+                    // LabAPI hint (works without Ruel/RueI)
+                    p.SendHint(text, 1.2f);
+                }
             }
-            catch { /* ignored */ }
-
-            _tagsByPlayerId.Clear();
-
-            base.Disable();
-        }
-
-        private void OnPlayerLeft(LabApi.Events.Arguments.PlayerEvents.PlayerLeftEventArgs ev)
-        {
-            // Clean up their tag so we don’t leak memory
-            if (ev?.Player != null)
-                _tagsByPlayerId.Remove(ev.Player.PlayerId);
-        }
-
-        private async Task Loop(CancellationToken token)
-        {
-            while (!token.IsCancellationRequested)
+            catch
             {
-                try
-                {
-                    // TimeTillRespawn is in seconds (int)
-                    int seconds = RespawnManager.Singleton != null
-                        ? RespawnManager.Singleton.TimeTillRespawn
-                        : 0;
-
-                    if (seconds < 0) seconds = 0;
-
-                    TimeSpan ts = TimeSpan.FromSeconds(seconds);
-                    string timeText = string.Format("{0:00}:{1:00}", (int)ts.TotalMinutes, ts.Seconds);
-
-                    // Match the “Respawning in: 00:00” style
-                    string text = "<b><color=#DADADA>Respawning in:</color> <color=#00FF6A>" + timeText + "</color></b>";
-
-                    foreach (Player p in Player.List)
-                    {
-                        if (p == null) continue;
-
-                        // ONLY spectators
-                        if (!p.IsSpectator)
-                            continue;
-
-                        RueDisplay display = RueDisplay.Get(p);
-
-                        Tag tag;
-                        if (!_tagsByPlayerId.TryGetValue(p.PlayerId, out tag))
-                        {
-                            tag = new Tag();
-                            _tagsByPlayerId[p.PlayerId] = tag;
-                        }
-
-                        // Update the same tag every tick (no Hide() needed)
-                        // Priority 800 is similar to RueI examples; adjust if you want it higher/lower.
-                        display.Show(tag, new BasicElement(800, text));
-                    }
-                }
-                catch
-                {
-                    // swallow exceptions to keep the loop alive
-                }
-
-                // Update rate (4x per second). You can change to 0.5s if you want.
-                try { await Task.Delay(250, token); } catch { }
+                // Keep the timer loop alive
             }
+        }
+
+        private static string FormatMmSs(int totalSeconds)
+        {
+            int minutes = totalSeconds / 60;
+            int seconds = totalSeconds % 60;
+            return string.Format("{0:00}:{1:00}", minutes, seconds);
+        }
+
+        // Reflection so it works across slight internal API differences
+        private static int GetSecondsToNextRespawn()
+        {
+            Assembly asm = AppDomain.CurrentDomain.GetAssemblies()
+                .FirstOrDefault(a => a.GetName().Name == "Assembly-CSharp");
+
+            if (asm == null)
+                return 0;
+
+            // Try Respawning.RespawnManager.Singleton.TimeTillRespawn
+            Type rmType = asm.GetType("Respawning.RespawnManager");
+            if (rmType != null)
+            {
+                object singleton = GetStaticMember(rmType, "Singleton");
+                if (singleton != null)
+                {
+                    int v;
+                    if (TryGetIntMember(singleton, "TimeTillRespawn", out v)) return v;
+                    if (TryGetIntMember(singleton, "SecondsToNextRespawn", out v)) return v;
+                }
+            }
+
+            // Fallback scan: any Respawning.* singleton with TimeTillRespawn
+            Type[] types;
+            try { types = asm.GetTypes(); }
+            catch { return 0; }
+
+            for (int i = 0; i < types.Length; i++)
+            {
+                Type t = types[i];
+                if (t == null || t.Namespace == null) continue;
+                if (!t.Namespace.StartsWith("Respawning")) continue;
+
+                object singleton = GetStaticMember(t, "Singleton");
+                if (singleton == null) continue;
+
+                int v;
+                if (TryGetIntMember(singleton, "TimeTillRespawn", out v)) return v;
+                if (TryGetIntMember(singleton, "SecondsToNextRespawn", out v)) return v;
+            }
+
+            return 0;
+        }
+
+        private static object GetStaticMember(Type t, string name)
+        {
+            try
+            {
+                PropertyInfo p = t.GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                if (p != null) return p.GetValue(null, null);
+
+                FieldInfo f = t.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                if (f != null) return f.GetValue(null);
+            }
+            catch { }
+            return null;
+        }
+
+        private static bool TryGetIntMember(object obj, string name, out int value)
+        {
+            value = 0;
+            if (obj == null) return false;
+
+            Type t = obj.GetType();
+            try
+            {
+                PropertyInfo p = t.GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (p != null && p.PropertyType == typeof(int))
+                {
+                    value = (int)p.GetValue(obj, null);
+                    return true;
+                }
+
+                FieldInfo f = t.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (f != null && f.FieldType == typeof(int))
+                {
+                    value = (int)f.GetValue(obj);
+                    return true;
+                }
+            }
+            catch { }
+            return false;
         }
     }
 }
